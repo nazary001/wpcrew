@@ -24,13 +24,20 @@ function CardImage({
       />
     );
   }
+  // Branded fallback when an article has no cover — reads as intentional
+  // editorial art, not a broken/empty image.
   return (
     <span
       aria-hidden="true"
-      className="absolute inset-0 flex items-center justify-center bg-parchment"
+      className="absolute inset-0 flex items-center justify-center bg-ink"
+      style={{
+        backgroundImage:
+          "repeating-linear-gradient(135deg, rgba(255,255,255,0.05) 0 2px, transparent 2px 16px)",
+      }}
     >
-      <span className="font-display text-6xl font-semibold text-line">
+      <span className="font-display text-5xl font-bold leading-none text-white">
         {article.title.charAt(0).toUpperCase()}
+        <span className="text-marker">.</span>
       </span>
     </span>
   );

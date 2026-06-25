@@ -41,9 +41,12 @@ export default async function HomePage() {
     ...CATEGORIES.map((c) => fetchLatestByCategory(c.slug, 4)),
   ]);
 
-  const hero = latest[0];
-  const gridArticles = latest.slice(1, 7);
-  const readMore = latest.slice(7, 10);
+  // Lead with an article that actually has a cover, so the big hero card is
+  // never a placeholder; fall back to the newest if none have one yet.
+  const hero = latest.find((a) => a.featuredImage) ?? latest[0];
+  const rest = latest.filter((a) => a.slug !== hero?.slug);
+  const gridArticles = rest.slice(0, 6);
+  const readMore = rest.slice(6, 9);
 
   return (
     <div className="mx-auto max-w-6xl px-4 py-8 sm:px-6 sm:py-10">
