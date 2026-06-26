@@ -41,6 +41,7 @@ export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
     lastModified: a.updatedAt || a.publishedAt || undefined,
     changeFrequency: "weekly",
     priority: 0.7,
+    ...(a.featuredImage ? { images: [a.featuredImage] } : {}),
   }));
 
   const authorPages: MetadataRoute.Sitemap = authors.map((a) => ({
