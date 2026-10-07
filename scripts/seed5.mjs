@@ -1,16 +1,22 @@
 /**
  * Seeds the WP Crew post5 / category5 / author5 collections in the shared
- * (nice-advice family) Strapi from scripts/articles.json (written by gen5.mjs).
- * Cover images are CC0 photos from the Openverse API.
+ * (nice-advice family) MongoDB from scripts/articles.json (written by gen5.mjs).
+ * Cover images are CC0 photos from the Openverse API, uploaded to S3.
  *
- * Run:  node --env-file=.env.local scripts/seed5.mjs [articles-file.json]
- * Needs STRAPI_API_URL + STRAPI_TOKEN with create perms on post5/category5/
- * author5 and the Upload plugin.
+ * Run:  node --env-file=.env.local scripts/seed5.mjs [articles-file.json] [--dry-run]
+ * Needs MONGODB_URI (+ MONGODB_DB), MEDIA_BASE_URL, S3_BUCKET, AWS_REGION and
+ * AWS credentials (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY) allowed to
+ * PutObject into the bucket. --dry-run only reads: it prints what would be
+ * created and uploads / writes nothing.
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { createUploader } from "./lib/media.mjs";
+import { coll, getClient, newDoc } from "./lib/mongo.mjs";
 
-const ARTICLES_FILE = process.argv[2] ?? "articles.json";
+const args = process.argv.slice(2);
+const DRY = args.includes("--dry-run");
+const ARTICLES_FILE = args.find((a) => !a.startsWith("--")) ?? "articles.json";
 const USED_IMAGES_PATH = resolve(import.meta.dirname, "used-images.json");
 
 function loadUsedImages() {
@@ -22,13 +28,15 @@ function loadUsedImages() {
 }
 const usedImages = loadUsedImages();
 
-const STRAPI_URL = (process.env.STRAPI_API_URL ?? "").replace(/\/+$/, "");
-const STRAPI_TOKEN = process.env.STRAPI_TOKEN ?? "";
-if (!STRAPI_URL || !STRAPI_TOKEN) {
-  console.error("STRAPI_API_URL / STRAPI_TOKEN are not set.");
+if (!process.env.MONGODB_URI) {
+  console.error("MONGODB_URI is not set.");
   process.exit(1);
 }
-const AUTH = { Authorization: `Bearer ${STRAPI_TOKEN}` };
+if (!DRY && (!process.env.S3_BUCKET || !process.env.MEDIA_BASE_URL)) {
+  console.error("S3_BUCKET / MEDIA_BASE_URL are not set.");
+  process.exit(1);
+}
+const uploader = createUploader({ dryRun: DRY });
 
 const CATEGORIES = [
   { name: "Web Design", slug: "web-design", description: "Layout, color, typography and visual craft — the design principles and trends that make sites look great and work well." },
@@ -49,32 +57,22 @@ const AUTHORS = [
     bio: [p("Priya writes about usability, design systems and the no-code tools that let anyone ship a real website. She believes the best interface is the one nobody has to think about.")] },
 ];
 
-async function api(path, init = {}) {
-  const res = await fetch(`${STRAPI_URL}/api/${path}`, {
-    ...init,
-    headers: { ...AUTH, ...(init.headers ?? {}) },
-  });
-  const body = await res.json().catch(() => null);
-  if (!res.ok) {
-    const detail = body?.error ? JSON.stringify(body.error) : res.statusText;
-    throw new Error(`${init.method ?? "GET"} /${path} -> ${res.status}: ${detail}`);
-  }
-  return body;
-}
-
+/** Find-or-create by slug; returns the `{ id, documentId }` relation ref. */
 async function ensureEntry(collection, slug, payload) {
-  const found = await api(`${collection}?filters[slug][$eq]=${encodeURIComponent(slug)}`);
-  if (Array.isArray(found.data) && found.data.length > 0) {
+  const c = await coll(collection);
+  const found = await c.findOne({ slug }, { projection: { id: 1, documentId: 1 } });
+  if (found) {
     console.log(`  = ${collection}/${slug} already exists`);
-    return found.data[0].documentId;
+    return { id: found.id, documentId: found.documentId };
   }
-  const created = await api(collection, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ data: payload }),
-  });
+  if (DRY) {
+    console.log(`  + would create ${collection}/${slug}`);
+    return { id: 0, documentId: `dry-run-${slug}` };
+  }
+  const doc = await newDoc(collection, { ...payload, posts: [] }, { publish: true });
+  await c.insertOne(doc);
   console.log(`  + created ${collection}/${slug}`);
-  return created.data.documentId;
+  return { id: doc.id, documentId: doc.documentId };
 }
 
 async function findCc0Image(query) {
@@ -114,18 +112,6 @@ async function downloadImage(candidates) {
   return null;
 }
 
-async function uploadImage(buf, contentType, filename) {
-  const form = new FormData();
-  form.append("files", new Blob([buf], { type: contentType }), filename);
-  const res = await fetch(`${STRAPI_URL}/api/upload`, { method: "POST", headers: AUTH, body: form });
-  const body = await res.json().catch(() => null);
-  if (!res.ok) {
-    const detail = body?.error ? JSON.stringify(body.error) : res.statusText;
-    throw new Error(`upload -> ${res.status}: ${detail}`);
-  }
-  return body[0].id;
-}
-
 function sectionsToBlocks(sections) {
   const blocks = [];
   for (const section of sections) {
@@ -146,94 +132,94 @@ function sectionsToBlocks(sections) {
   return blocks;
 }
 
-async function createArticle(entry, categoryIds, authorIds, idx) {
+async function createArticle(entry, categoryRefs, authorRefs, idx) {
   const { article, category } = entry;
-  const existing = await api(`post5s?filters[slug][$eq]=${encodeURIComponent(article.slug)}`);
-  if (Array.isArray(existing.data) && existing.data.length > 0) {
+  const posts = await coll("post5s");
+  const existing = await posts.findOne({ slug: article.slug }, { projection: { _id: 1 } });
+  if (existing) {
     console.log(`  = article "${article.slug}" already exists, skipping`);
     return "skipped";
   }
   const query = entry.imageQuery ?? (article.tags ?? []).slice(0, 3).join(" ") ?? "web design desk";
-  let imageId = null;
-  try {
-    const candidates = await findCc0Image(query);
-    const image = await downloadImage(candidates);
-    if (image) {
-      const ext = image.contentType.includes("png") ? "png" : "jpg";
-      imageId = await uploadImage(image.buf, image.contentType, `${article.slug}-cover.${ext}`);
-      console.log(`  ↑ image uploaded for "${article.slug}" (id ${imageId})`);
-    } else {
-      console.warn(`  ! no usable CC0 image for "${article.slug}" (query: ${query})`);
+  let featuredImage = null;
+  if (DRY) {
+    console.log(`  ~ would find a CC0 cover for "${article.slug}" (query: ${query}) and upload it to S3`);
+  } else {
+    try {
+      const candidates = await findCc0Image(query);
+      const image = await downloadImage(candidates);
+      if (image) {
+        const ext = image.contentType.includes("png") ? "png" : "jpg";
+        featuredImage = await uploader.upload(image.buf, {
+          filename: `${article.slug}-cover.${ext}`,
+          contentType: image.contentType,
+        });
+        console.log(`  ↑ image uploaded for "${article.slug}" (${featuredImage.s3Key}, files id ${featuredImage.id})`);
+      } else {
+        console.warn(`  ! no usable CC0 image for "${article.slug}" (query: ${query})`);
+      }
+    } catch (err) {
+      console.warn(`  ! image step failed for "${article.slug}": ${err.message}`);
     }
-  } catch (err) {
-    console.warn(`  ! image step failed for "${article.slug}": ${err.message}`);
   }
 
-  const payload = {
-    data: {
-      title: article.title,
-      slug: article.slug,
-      description: article.description,
-      content: sectionsToBlocks(article.sections),
-      ...(imageId ? { featuredImage: imageId } : {}),
-      views: Math.floor(Math.random() * 160) + 25,
-      tags: article.tags ?? [],
-      isPopular: idx < 4,
-      category: categoryIds[category],
-      author: authorIds[AUTHORS[idx % AUTHORS.length].slug],
-    },
+  const categoryRef = categoryRefs[category];
+  const authorRef = authorRefs[AUTHORS[idx % AUTHORS.length].slug];
+  const data = {
+    title: article.title,
+    slug: article.slug,
+    description: article.description,
+    content: sectionsToBlocks(article.sections),
+    featuredImage,
+    contentImage1: null,
+    contentImage2: null,
+    category: categoryRef,
+    author: authorRef,
+    tags: article.tags ?? [],
+    views: Math.floor(Math.random() * 160) + 25,
+    isPopular: idx < 4,
   };
-  try {
-    await api("post5s?status=published", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    console.log(`  ✓ published "${article.title}"`);
-    return "published";
-  } catch (err) {
-    console.warn(`  ! publish-on-create failed (${err.message}); two-step...`);
-    const created = await api("post5s", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    await api(`post5s/${created.data.documentId}?status=published`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    console.log(`  ✓ published "${article.title}" (two-step)`);
+  if (DRY) {
+    console.log(`  ✓ would publish "${article.title}" (${category}, author ${authorRef.documentId})`);
     return "published";
   }
+  const doc = await newDoc("post5s", data, { publish: true });
+  await posts.insertOne(doc);
+  // Keep the inverse (oneToMany) sides in step, as Strapi did.
+  const ref = { id: doc.id, documentId: doc.documentId };
+  await (await coll("category5s")).updateOne({ documentId: categoryRef.documentId }, { $addToSet: { posts: ref } });
+  await (await coll("author5s")).updateOne({ documentId: authorRef.documentId }, { $addToSet: { posts: ref } });
+  console.log(`  ✓ published "${article.title}"`);
+  return "published";
 }
 
 async function main() {
   const articles = JSON.parse(readFileSync(resolve(import.meta.dirname, ARTICLES_FILE), "utf8"));
-  console.log(`Seeding ${articles.length} articles from ${ARTICLES_FILE} to ${STRAPI_URL}\n`);
+  console.log(`Seeding ${articles.length} articles from ${ARTICLES_FILE} into ${process.env.MONGODB_DB || "gc"}${DRY ? " (dry run)" : ""}\n`);
 
   console.log("Categories:");
-  const categoryIds = {};
-  for (const c of CATEGORIES) categoryIds[c.slug] = await ensureEntry("category5s", c.slug, c);
+  const categoryRefs = {};
+  for (const c of CATEGORIES) categoryRefs[c.slug] = await ensureEntry("category5s", c.slug, c);
 
   console.log("Authors:");
-  const authorIds = {};
-  for (const a of AUTHORS) authorIds[a.slug] = await ensureEntry("author5s", a.slug, a);
+  const authorRefs = {};
+  for (const a of AUTHORS) authorRefs[a.slug] = await ensureEntry("author5s", a.slug, { ...a, avatar: null });
 
   console.log("Articles:");
   let published = 0, skipped = 0;
   const failed = [];
   for (let i = 0; i < articles.length; i++) {
     try {
-      const r = await createArticle(articles[i], categoryIds, authorIds, i);
+      const r = await createArticle(articles[i], categoryRefs, authorRefs, i);
       if (r === "published") published++; else skipped++;
     } catch (err) {
       console.error(`  ✗ "${articles[i].article?.slug}": ${err.message}`);
       failed.push(articles[i].article?.slug);
     }
   }
-  console.log(`\nDone: ${published} published, ${skipped} skipped, ${failed.length} failed`);
+  console.log(`\nDone: ${published} ${DRY ? "would be " : ""}published, ${skipped} skipped, ${failed.length} failed`);
   if (failed.length) console.log(`Failed: ${failed.join(", ")}`);
+  await (await getClient()).close();
 }
 
 main().catch((err) => { console.error(err); process.exit(1); });
